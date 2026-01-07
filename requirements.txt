@@ -1,0 +1,8 @@
+streamlit
+torch
+torchvision
+transformers
+pandas
+numpy
+scikit-learn
+Pillow

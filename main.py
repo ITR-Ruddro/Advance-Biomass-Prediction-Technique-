@@ -1,119 +1,20 @@
-# =========================
-# OFFLINE SAFETY
-# =========================
-import os
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
-os.environ["TORCH_HOME"] = "/root/.cache/torch"
-
-# =========================
-# IMPORTS
-# =========================
+import streamlit as st
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
-import pandas as pd
 import numpy as np
-from pathlib import Path
-from tqdm import tqdm
-from sklearn.preprocessing import LabelEncoder
-
-# =========================
-# DEVICE
-# =========================
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# =========================
-# LOAD DINOv2
-# =========================
 from transformers import AutoModel
 
-DINO_PATH = "/kaggle/input/dinov2/pytorch/small/1"
-dinov2 = AutoModel.from_pretrained(DINO_PATH, local_files_only=True).to(device)
-
-# 🔓 Unfreeze last 2 blocks
-for block in dinov2.encoder.layer[-2:]:
-    for p in block.parameters():
-        p.requires_grad = True
-
-# =========================
-# DATA PREP
-# =========================
-def prepare_data(df):
-    df["image_id"] = df["sample_id"].str.split("__").str[0]
-
-    # 🔥 LOG TARGET
-    df["target"] = np.log1p(df["target"])
-
-    le_state = LabelEncoder()
-    le_species = LabelEncoder()
-    df["State_encoded"] = le_state.fit_transform(df["State"])
-    df["Species_encoded"] = le_species.fit_transform(df["Species"])
-    return df, le_state, le_species
-
-# =========================
-# DATASET
-# =========================
-class GrassDataset(Dataset):
-    def __init__(self, df, image_base_dir, transform, mean, std, train=True):
-        self.df = df
-        self.base = Path(image_base_dir)
-        self.transform = transform
-        self.train = train
-        self.mean = mean
-        self.std = std
-
-        self.targets = ["Dry_Green_g", "Dry_Dead_g", "Dry_Clover_g", "GDM_g", "Dry_Total_g"]
-        self.groups = df.groupby("image_id")
-        self.ids = list(self.groups.groups.keys())
-
-    def __len__(self):
-        return len(self.ids)
-
-    def __getitem__(self, idx):
-        img_id = self.ids[idx]
-        g = self.groups.get_group(img_id)
-
-        img = Image.open(self.base / g.iloc[0]["image_path"]).convert("RGB")
-        img = self.transform(img)
-
-        meta = torch.tensor([
-            g.iloc[0]["Pre_GSHH_NDVI"],
-            g.iloc[0]["Height_Ave_cm"],
-            g.iloc[0]["State_encoded"],
-            g.iloc[0]["Species_encoded"]
-        ], dtype=torch.float32)
-
-        if not self.train:
-            return img, meta, img_id
-
-        y = []
-        for i, t in enumerate(self.targets):
-            val = g[g["target_name"] == t]["target"].values[0]
-            y.append((val - self.mean[i]) / self.std[i])
-
-        return img, meta, torch.tensor(y, dtype=torch.float32)
-
-# =========================
-# TRANSFORMS
-# =========================
-transform = transforms.Compose([
-    transforms.Resize((224,224)),
-    transforms.RandomHorizontalFlip(),
-    transforms.ColorJitter(0.2,0.2,0.2),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
-])
-
-# =========================
-# MODEL
-# =========================
+# -----------------------------
+# 1. MODEL ARCHITECTURE
+# -----------------------------
+# মডেল ক্লাসটি হুবহু ট্রেইনিং কোডের মতো হতে হবে
 class BiomassPredictor(nn.Module):
     def __init__(self):
         super().__init__()
-        self.backbone = dinov2
+        # Streamlit-এ আমরা সরাসরি Hugging Face থেকে মডেল নামাবো
+        self.backbone = AutoModel.from_pretrained("facebook/dinov2-small")
         self.head = nn.Sequential(
             nn.Linear(384+4, 512),
             nn.BatchNorm1d(512),
@@ -129,146 +30,101 @@ class BiomassPredictor(nn.Module):
         feat = self.backbone(pixel_values=x).last_hidden_state[:,0]
         return self.head(torch.cat([feat, meta], 1))
 
-# =========================
-# TRAIN
-# =========================
-def train_epoch(model, loader, opt, loss_fn):
-    model.train()
-    total = 0
-    for x, m, y in tqdm(loader):
-        x,m,y = x.to(device), m.to(device), y.to(device)
-        p = model(x,m)
-        loss = loss_fn(p,y)
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
-        total += loss.item()
-    return total/len(loader)
+# -----------------------------
+# 2. CONFIG & LOADING
+# -----------------------------
+# CPU তে রান করার জন্য কনফিগারেশন
+device = torch.device("cpu") 
 
-# =========================
-# MAIN
-# =========================
-def main():
-    df = pd.read_csv("/kaggle/input/csiro-biomass/train.csv")
-    df, le_state, le_species = prepare_data(df)
-
-    targets = ["Dry_Green_g","Dry_Dead_g","Dry_Clover_g","GDM_g","Dry_Total_g"]
-    stats = df.groupby("target_name")["target"].agg(["mean","std"]).loc[targets]
-    mean, std = stats["mean"].values, stats["std"].values + 1e-6
-
-    ds = GrassDataset(df,"/kaggle/input/csiro-biomass",transform,mean,std)
-    dl = DataLoader(ds, batch_size=16, shuffle=True, num_workers=2)
-
-    model = BiomassPredictor().to(device)
-
-    opt = torch.optim.AdamW([
-        {"params": model.backbone.parameters(), "lr": 1e-5},
-        {"params": model.head.parameters(), "lr": 5e-4},
-    ], weight_decay=1e-4)
-
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, 25)
-    loss_fn = nn.SmoothL1Loss()
-
-    for e in range(25):
-        l = train_epoch(model, dl, opt, loss_fn)
-        sched.step()
-        print(f"Epoch {e+1}: {l:.4f}")
-
-    torch.save({
-        "model": model.state_dict(),
-        "mean": mean,
-        "std": std,
-        "state": le_state,
-        "species": le_species
-    }, "model.pth")
-
-    return model, mean, std
-
-# =========================
-# PREDICT
-# =========================
-def predict(model, mean, std):
-    df = pd.read_csv("/kaggle/input/csiro-biomass/test.csv")
-    df["image_id"] = df["sample_id"].str.split("__").str[0]
-    df["State_encoded"]=0; df["Species_encoded"]=0
-    df["Pre_GSHH_NDVI"]=0.5; df["Height_Ave_cm"]=10.0
-
-    ds = GrassDataset(df,"/kaggle/input/csiro-biomass",transform,mean,std,train=False)
+@st.cache_resource
+def load_model():
+    # মডেল ইনিশিলাইজ করা
+    model = BiomassPredictor()
+    
+    # সেভ করা ওয়েট লোড করা (map_location='cpu' জরুরি)
+    checkpoint = torch.load("model.pth", map_location=device)
+    
+    # ওয়েট লোড করা
+    model.load_state_dict(checkpoint["model"])
+    model.to(device)
     model.eval()
-    out=[]
-    with torch.no_grad():
-        for x,m,i in tqdm(ds):
-            p = model(x.unsqueeze(0).to(device), m.unsqueeze(0).to(device))[0]
-            p = np.expm1(p.cpu().numpy()*std + mean)
-            for t,v in zip(["Dry_Green_g","Dry_Dead_g","Dry_Clover_g","GDM_g","Dry_Total_g"],p):
-                out.append({"sample_id":f"{i}__{t}","target":float(v)})
+    
+    return model, checkpoint["mean"], checkpoint["std"], checkpoint["state"], checkpoint["species"]
 
-    pd.DataFrame(out).to_csv("submission.csv", index=False)
+# লোডিং মেসেজ
+with st.spinner('Model loading... Please wait...'):
+    try:
+        model, mean, std, le_state, le_species = load_model()
+        st.success("Model Loaded Successfully!")
+    except FileNotFoundError:
+        st.error("Error: 'model.pth' not found. Please upload it to the repo.")
+        st.stop()
 
-# =========================
-# RUN
-# =========================
-model, mean, std = main()
-predict(model, mean, std)
+# -----------------------------
+# 3. UI DESIGN
+# -----------------------------
+st.title("🌾 Grass Biomass Predictor")
+st.write("Upload an image of grass to predict biomass components.")
 
-import torch
-import numpy as np
-import matplotlib.pyplot as plt
-from PIL import Image
-from torchvision import transforms
+# ইউজার ইনপুট (মেটাডেটা)
+col1, col2 = st.columns(2)
+with col1:
+    ndvi = st.number_input("NDVI Value", value=0.6, step=0.01)
+    height = st.number_input("Average Height (cm)", value=12.0, step=0.5)
 
-# =========================
-# IMAGE PATH
-# =========================
-img_path = "/kaggle/input/csiro-biomass/test/ID1001187975.jpg"
-img = Image.open(img_path).convert("RGB")
+with col2:
+    # এনকোডার থেকে ক্লাস বের করা
+    state_options = list(le_state.classes_)
+    species_options = list(le_species.classes_)
+    
+    state = st.selectbox("State", state_options)
+    species = st.selectbox("Species", species_options)
 
-# =========================
-# TRANSFORM (same as training)
-# =========================
-transform = transforms.Compose([
-    transforms.Resize((224,224)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
-])
-img_tensor = transform(img).unsqueeze(0).to(device)
+# ইমেজ আপলোড
+uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "png", "jpeg"])
 
-# =========================
-# DUMMY METADATA
-# =========================
-meta = torch.tensor([[0.5, 10.0, 0, 0]], dtype=torch.float32).to(device)
+# -----------------------------
+# 4. PREDICTION LOGIC
+# -----------------------------
+if uploaded_file is not None:
+    # ইমেজ প্রসেসিং
+    image = Image.open(uploaded_file).convert("RGB")
+    st.image(image, caption='Uploaded Image', use_column_width=True)
+    
+    # ট্রান্সফর্ম (ট্রেইনিং এর মতো হতে হবে)
+    transform = transforms.Compose([
+        transforms.Resize((224,224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+    ])
+    
+    img_tensor = transform(image).unsqueeze(0).to(device)
+    
+    # মেটাডেটা এনকোডিং
+    state_idx = le_state.transform([state])[0]
+    species_idx = le_species.transform([species])[0]
+    
+    meta_tensor = torch.tensor([
+        ndvi, 
+        height, 
+        state_idx, 
+        species_idx
+    ], dtype=torch.float32).unsqueeze(0).to(device)
 
-# =========================
-# PREDICTION
-# =========================
-model.eval()
-with torch.no_grad():
-    pred = model(img_tensor, meta)[0]
-    pred = np.expm1(pred.cpu().numpy() * std + mean)
-
-# =========================
-# VISUALIZATION
-# =========================
-targets = ["Dry_Green_g", "Dry_Dead_g", "Dry_Clover_g", "GDM_g", "Dry_Total_g"]
-
-fig, axes = plt.subplots(1, 2, figsize=(14,6))
-
-# --- Left: Image ---
-axes[0].imshow(img)
-axes[0].axis('off')
-axes[0].set_title("Test Image", fontsize=14)
-
-# --- Right: Bar chart ---
-bars = axes[1].bar(targets, pred, color=['green','brown','yellow','blue','purple'])
-axes[1].set_title("Predicted Biomass", fontsize=14)
-axes[1].set_ylabel("Biomass (g)")
-axes[1].set_xlabel("Target")
-axes[1].grid(axis='y', linestyle='--', alpha=0.6)
-
-# Annotate bars
-for bar in bars:
-    yval = bar.get_height()
-    axes[1].text(bar.get_x() + bar.get_width()/2, yval + 0.05, f"{yval:.2f}", ha='center', va='bottom')
-
-plt.tight_layout()
-plt.show()
+    # প্রেডিকশন
+    if st.button("Predict Biomass"):
+        with torch.no_grad():
+            preds = model(img_tensor, meta_tensor)
+            # রিভার্স ট্রান্সফর্মেশন (Standardization & Log)
+            preds = preds.cpu().numpy()[0] * std + mean
+            preds = np.expm1(preds) # exp(x) - 1
+            
+        # রেজাল্ট দেখানো
+        targets = ["Dry_Green_g", "Dry_Dead_g", "Dry_Clover_g", "GDM_g", "Dry_Total_g"]
+        
+        st.subheader("Results:")
+        results = {t: round(v, 2) for t, v in zip(targets, preds)}
+        st.json(results)
+        
+        # বার চার্ট
+        st.bar_chart(results)
